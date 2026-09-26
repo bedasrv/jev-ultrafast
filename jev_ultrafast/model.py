@@ -9,7 +9,35 @@ import httpx
 
 from .questions import NEXT_ACTION, TARGET, TEXT_VALUE
 
-CLIENT = httpx.Client(http2=True, timeout=25)
+
+def _timeout():
+    raw = os.environ.get("TYPESAFE_TIMEOUT_MS")
+    if not raw:
+        return 25.0
+    try:
+        return max(1.0, float(raw) / 1000.0)
+    except ValueError:
+        return 25.0
+
+
+CLIENT = httpx.Client(http2=True, timeout=_timeout())
+
+# System One base URL. Upstream hardcodes the public vendor
+# (https://api.typesafe.ai); this host runs a SELF-HOSTED endpoint on the LAN,
+# so the base must be overridable or the self-hosted credential would be sent to
+# the public vendor. Unset -> upstream default, so behaviour is unchanged
+# elsewhere. TYPESAFE_BASE_URL may be given with or without a trailing /v1.
+PUBLIC_SYSTEMONE = "https://api.typesafe.ai/v1/systemone"
+
+
+def systemone_url():
+    base = os.environ.get("TYPESAFE_BASE_URL")
+    if not base:
+        return PUBLIC_SYSTEMONE
+    base = base.rstrip("/")
+    if base.endswith("/v1"):
+        return f"{base}/systemone"
+    return f"{base}/v1/systemone"
 
 
 def post_json(url, key, body):
@@ -116,7 +144,7 @@ def choose(state, goal, history):
         "questions": questions,
     }
     started = time.perf_counter()
-    result = post_json("https://api.typesafe.ai/v1/systemone", os.environ["TYPESAFE_API_KEY"], body)
+    result = post_json(systemone_url(), os.environ["TYPESAFE_API_KEY"], body)
     operation_answer = validate_choice(result["answers"].get("operation", {}), operations)
     operation = operation_answer["choice"]
     target = None
