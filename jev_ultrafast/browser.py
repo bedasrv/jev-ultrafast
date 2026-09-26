@@ -17,6 +17,20 @@ class StalePage(ValueError):
     """A decision no longer refers to the observed page."""
 
 
+def missing_chrome_target(error):
+    """Chrome already discarded the tab: the user closed it, or the browser exited.
+
+    Chrome quits when its last window closes, so this is routine on a desktop host
+    rather than exceptional.
+    """
+    detail = error.args[0] if getattr(error, "args", None) else error
+    if isinstance(detail, dict):
+        return detail.get("code") == -32602 or "No target with given id found" in str(
+            detail.get("message", "")
+        )
+    return "No target with given id found" in str(error)
+
+
 class Browser:
     def __init__(self, url):
         ensure_daemon()
@@ -107,9 +121,16 @@ class Browser:
         return result
 
     def close(self):
-        if self.target:
-            cdp("Target.closeTarget", targetId=self.target)
-            self.target = None
+        target, self.target = self.target, None
+        if not target:
+            return
+        try:
+            cdp("Target.closeTarget", targetId=target)
+        except RuntimeError as error:
+            # Chrome already discarded the tab. Keep this instance closable so a
+            # new run can start instead of failing on the previous tab's close.
+            if not missing_chrome_target(error):
+                raise
 
 
 def fingerprint(state):
@@ -185,7 +206,15 @@ def browser_operation(request):
                     call("Input.insertText", text=request["text"])
         return {"executed": action["id"]}
 
-    info = evaluate(READ_STATE)
+    # The observe read, and only it, gets the DevTools command-line API so
+    # snapshot.js can call `getEventListeners`. Every other read of READ_STATE
+    # reuses the set this one found, so the freshness marker and the observation
+    # agree about which controls exist.
+    result = call("Runtime.evaluate", expression=READ_STATE, returnByValue=True,
+                  includeCommandLineAPI=True)
+    if result.get("exceptionDetails"):
+        raise StalePage("Document changed during evaluation")
+    info = result.get("result", {}).get("value")
     if info is None:
         raise StalePage("Document is navigating")
     info["fingerprint"] = fingerprint(info)

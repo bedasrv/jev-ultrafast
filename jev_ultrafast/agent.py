@@ -65,13 +65,16 @@ class Agent:
         elif name == "predict":
             if not state["browser"]:
                 raise ValueError("Start a demo first")
+            # Reject a stopped run before any freshness recovery re-observes the page.
+            if state["status"] in {"done", "blocked"}:
+                raise ValueError(
+                    "This run has stopped. Inspect the page before starting a fresh demo."
+                )
             if state["started_at"] is None:
                 state["started_at"] = time.perf_counter()
             if not state["browser"].fresh(state["page"]):
                 state["page"] = state["browser"].observe(screenshot=self.screenshots)
             state["decision"] = None
-            if state["status"] in {"done", "blocked"}:
-                raise ValueError("This run has stopped. Start a fresh demo.")
             if len(state["decisions"]) >= MAX_STEPS * 2:
                 raise ValueError("Reached the demo's model-call budget")
             state["decision"] = choose(state["page"], state["goal"], state["history"])
@@ -114,7 +117,17 @@ class Agent:
                     self.pending_text = (context, text, helper)
                     state["text_calls"].append({**helper, "field": action["label"], "value": text})
             # Browser.act checks freshness immediately before input, including after text generation.
-            state["browser"].act(action, page, text=text)
+            # A lost reply or interrupt does not prove the browser did nothing: consuming this
+            # decision cannot stop a fresh prediction from replaying the action. Only StalePage
+            # guarantees input never started, so only that one is safe to retry.
+            execution_error = None
+            try:
+                state["browser"].act(action, page, text=text)
+            except StalePage:
+                raise
+            except BaseException as error:
+                state["status"] = "blocked"
+                execution_error = error
             self.pending_text = None
             state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
             # Record execution before observing. A stale post-action observation must not erase the action.
@@ -135,10 +148,15 @@ class Agent:
                     "page_changed": None,
                     "url": page["url"],
                     "usage": decision["usage"],
-                    "executed_ms": round((time.perf_counter() - state["started_at"]) * 1000),
+                    "execution": "unknown" if execution_error is not None else "confirmed",
+                    "executed_ms": state["elapsed_ms"] if execution_error is None else None,
                     "elapsed_ms": state["elapsed_ms"],
                 }
             )
+            if execution_error is not None:
+                # Record the attempted action, then stop the run. Callers must not
+                # call tick/run again: the browser may already have applied it.
+                raise execution_error
             state["page"] = state["browser"].observe(screenshot=self.screenshots)
             state["elapsed_ms"] = round((time.perf_counter() - state["started_at"]) * 1000)
             state["history"][-1].update(
