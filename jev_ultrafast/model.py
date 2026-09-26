@@ -22,22 +22,51 @@ def _timeout():
 
 CLIENT = httpx.Client(http2=True, timeout=_timeout())
 
-# System One base URL. Upstream hardcodes the public vendor
-# (https://api.typesafe.ai); this host runs a SELF-HOSTED endpoint on the LAN,
-# so the base must be overridable or the self-hosted credential would be sent to
-# the public vendor. Unset -> upstream default, so behaviour is unchanged
-# elsewhere. TYPESAFE_BASE_URL may be given with or without a trailing /v1.
+# System One endpoint. Upstream hardcoded the public vendor, so a self-hosted
+# deployment could not point the policy at its own server: the call always left
+# the local network, carrying that deployment's API key to a third party, and
+# failed because a self-hosted key is not valid against the public API.
+#
+# TYPESAFE_ENDPOINT is the full URL, matching #28. TYPESAFE_BASE_URL is accepted
+# as a convenience for a bare base (with or without a trailing /v1). Unset ->
+# the previous public default, so an unconfigured install is unchanged.
 PUBLIC_SYSTEMONE = "https://api.typesafe.ai/v1/systemone"
 
 
 def systemone_url():
-    base = os.environ.get("TYPESAFE_BASE_URL")
+    endpoint = os.environ.get("TYPESAFE_ENDPOINT", "").strip()
+    if endpoint:
+        return endpoint
+    base = os.environ.get("TYPESAFE_BASE_URL", "").strip().rstrip("/")
     if not base:
         return PUBLIC_SYSTEMONE
-    base = base.rstrip("/")
     if base.endswith("/v1"):
         return f"{base}/systemone"
     return f"{base}/v1/systemone"
+
+
+def provider_error_detail(response):
+    """The provider's own explanation, when it sends one.
+
+    Unknown-field rejections are only actionable with this text: a bare
+    "HTTP 400" does not say which key was rejected.
+    """
+    try:
+        payload = response.json()
+    except ValueError:
+        return ""
+    if isinstance(payload, list) and payload:  # some OpenAI shims wrap errors in a list
+        payload = payload[0]
+    if not isinstance(payload, dict):
+        return ""
+    error = payload.get("error", payload)
+    if not isinstance(error, dict):
+        return ""
+    message = error.get("message")
+    if not isinstance(message, str) or not message.strip():
+        return ""
+    return ": " + " ".join(message.split())[:200]
+
 
 
 def post_json(url, key, body):
@@ -50,7 +79,10 @@ def post_json(url, key, body):
             time.sleep(0.5 * 2**attempt)
             continue
         if response.is_error:
-            raise RuntimeError(f"Model provider returned HTTP {response.status_code}; no action executed.")
+            raise RuntimeError(
+                f"Model provider returned HTTP {response.status_code}"
+                f"{provider_error_detail(response)}; no action executed."
+            )
         return response.json()
     raise RuntimeError("Model unavailable")
 
@@ -189,11 +221,28 @@ def field_text(context):
     key = os.environ.get("TEXT_MODEL_API_KEY")
     if not key:
         raise ValueError("TYPE_TEXT needs TEXT_MODEL_API_KEY; no text is hardcoded or guessed by the executor.")
-    base = os.environ.get("TEXT_MODEL_BASE_URL", "https://api.deepseek.com/v1").rstrip("/")
-    model = os.environ.get("TEXT_MODEL", "deepseek-chat")
+    base = os.environ.get("TEXT_MODEL_BASE_URL", "").rstrip("/")
+    model = os.environ.get("TEXT_MODEL", "").strip()
+    if not base:
+        # The DeepSeek fallbacks only make sense together. With TEXT_MODEL set but no
+        # endpoint, the old default sent the configured key to api.deepseek.com, and
+        # README.md describes that key as an OpenRouter key -- so it left for a vendor it
+        # does not belong to. Paired defaults are kept for a genuinely unconfigured DeepSeek
+        # setup; the ambiguous half-configured case now fails loudly instead.
+        if model and model != "deepseek-chat":
+            raise ValueError(
+                "TEXT_MODEL is set but TEXT_MODEL_BASE_URL is not, so the key would be sent to "
+                "the default endpoint. Set TEXT_MODEL_BASE_URL to the endpoint that issued the key."
+            )
+        base = "https://api.deepseek.com/v1"
+    model = model or "deepseek-chat"
     reasoning = {"thinking": {"type": "disabled"}} if "api.deepseek.com/" in base else {"reasoning": {"effort": "low"}}
     if os.environ.get("TEXT_MODEL_REASONING") == "none":
         reasoning = {"reasoning": {"enabled": False}}
+    elif os.environ.get("TEXT_MODEL_REASONING", "").strip().lower() == "omit":
+        # Some OpenAI-compatible endpoints reject an unknown `reasoning` key outright.
+        # `none` still sends the key and 400s; omit leaves the field out entirely.
+        reasoning = {}
     started = time.perf_counter()
     result = post_json(
         base + "/chat/completions",
